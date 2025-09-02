@@ -22,6 +22,8 @@ import json
 import re
 import uuid
 from typing import Dict, Tuple
+import html as _html
+import streamlit.components.v1 as components
 
 import streamlit as st
 from sqlglot import parse_one, exp
@@ -225,6 +227,44 @@ def _apply_all(text: str, repls) -> str:
         text = pattern.sub(rep, text)
     return text
 
+def copy_to_clipboard_button(text: str, key: str, label: str = "📋 Copier"):
+    """Affiche un bouton qui copie 'text' dans le presse-papiers (côté navigateur)."""
+    if not text:
+        return
+    # On échappe pour éviter de casser le HTML quand le SQL contient des caractères spéciaux
+    escaped = _html.escape(text, quote=True)
+    components.html(f"""
+        <div>
+          <textarea id="{key}_ta" style="position:absolute; left:-10000px; top:-10000px;">{escaped}</textarea>
+          <button id="{key}_btn" style="margin-top:8px; padding:6px 10px; border-radius:8px; cursor:pointer;">
+            {label}
+          </button>
+          <span id="{key}_msg" style="margin-left:8px; color:gray; font-size:0.9em;"></span>
+        </div>
+        <script>
+          const btn = document.getElementById("{key}_btn");
+          const ta  = document.getElementById("{key}_ta");
+          const msg = document.getElementById("{key}_msg");
+          if (btn && ta) {{
+            btn.onclick = async () => {{
+              try {{
+                await navigator.clipboard.writeText(ta.value);
+                msg.textContent = "Copié !";
+                setTimeout(() => (msg.textContent = ""), 1500);
+              }} catch(e) {{
+                // Fallback: sélection + execCommand pour navigateurs anciens
+                ta.style.display = "block";
+                ta.select();
+                document.execCommand("copy");
+                ta.style.display = "none";
+                msg.textContent = "Copié !";
+                setTimeout(() => (msg.textContent = ""), 1500);
+              }}
+            }};
+          }}
+        </script>
+    """, height=60)
+
 def anonymize_sql(sql: str, nm: NameMapper) -> Tuple[str, NameMapper]:
     """
     1) Extrait/actualise le mapping via l'AST (sqlglot).
@@ -282,48 +322,60 @@ with st.expander("⚙️ Options"):
 
 left, right = st.columns(2)
 
+# ======= ANONYMISER =======
 with left:
     st.subheader("1) Anonymiser")
     src_sql = st.text_area(
         "Collez votre requête SQL d'origine (T-SQL)",
         height=250,
         placeholder="-- Exemple\nUSE AdventureWorks2019;\nSELECT p.PersonID, p.LastName FROM AdventureWorks2019.Person.Person AS p WHERE p.LastName = 'Smith';\n-- Un commentaire avec Person.Person et [LastName]",
+        key="src_sql_input",
     )
-    if st.button("Anonymiser", type="primary"):
+
+    if st.button("Anonymiser", type="primary", key="btn_anonymize"):
         if not src_sql.strip():
             st.warning("Veuillez coller une requête SQL.")
         else:
             try:
                 anonym_sql, _ = anonymize_sql(src_sql, st.session_state.name_mapper)
-                st.text_area("Requête anonymisée", value=anonym_sql, height=250, key="anonym_result")
+                st.session_state["anonym_sql"] = anonym_sql  # <<< mémorise le résultat
                 st.info("Copiez ce SQL anonymisé et utilisez-le dans votre prompt ChatGPT. Conservez le mapping (export) pour pouvoir rétablir les noms ensuite.")
-
-                # Bouton copier anonymisé
-                st.button("📋 Copier la requête anonymisée", on_click=st.session_state.setdefault, args=("copy_buffer", anonym_sql))
-
             except Exception as e:
                 st.error(str(e))
 
+    # Affichage persistant du résultat + bouton copier
+    anonym_result = st.session_state.get("anonym_sql", "")
+    st.text_area("Requête anonymisée", value=anonym_result, height=250, key="anonym_result", disabled=not bool(anonym_result))
+    if anonym_result:
+        copy_to_clipboard_button(anonym_result, key="copy_anonym", label="📋 Copier la requête anonymisée")
+
+
+# ======= DÉANONYMISER =======
 with right:
     st.subheader("2) Déanonymiser")
     mod_sql = st.text_area(
         "Collez la requête modifiée (toujours avec les noms anonymes)",
         height=250,
         placeholder="-- Collez ici le SQL renvoyé par ChatGPT, basé sur les noms anonymes (DB_*, SC_*, T_*, C_*).",
+        key="mod_sql_input",
     )
-    if st.button("Déanonymiser"):
+
+    if st.button("Déanonymiser", key="btn_deanonymize"):
         if not mod_sql.strip():
             st.warning("Veuillez coller une requête SQL.")
         else:
             try:
                 deanon_sql = deanonymize_sql(mod_sql, st.session_state.name_mapper)
-                st.text_area("Requête rétablie (noms d'origine)", value=deanon_sql, height=250, key="deanonym_result")
+                st.session_state["deanon_sql"] = deanon_sql  # <<< mémorise le résultat
                 st.info("Vérifiez le résultat. Les identifiants inconnus (non présents dans le mapping) sont laissés tels quels.")
-
-                # Bouton copier déanonymisé
-                st.button("📋 Copier la requête dé-anonymisée", on_click=st.session_state.setdefault, args=("copy_buffer", deanon_sql))
-
             except Exception as e:
                 st.error(str(e))
+
+    # Affichage persistant du résultat + bouton copier
+    deanon_result = st.session_state.get("deanon_sql", "")
+    st.text_area("Requête rétablie (noms d'origine)", value=deanon_result, height=250, key="deanonym_result", disabled=not bool(deanon_result))
+    if deanon_result:
+        copy_to_clipboard_button(deanon_result, key="copy_deanon", label="📋 Copier la requête dé-anonymisée")
+
 
 st.divider()
