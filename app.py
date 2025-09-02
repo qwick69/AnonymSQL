@@ -41,7 +41,6 @@ DEFAULT_PREFIXES = {
     "column": "C_",
 }
 
-@st.cache_data(show_spinner=False)
 def _new_session_id() -> str:
     return str(uuid.uuid4())
 
