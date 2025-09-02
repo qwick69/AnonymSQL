@@ -39,6 +39,38 @@ DEFAULT_PREFIXES = {
     "column": "C_",
 }
 
+SQL_START_RE = re.compile(
+    r"^\s*(SELECT|WITH|UPDATE|INSERT|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE|EXEC|DECLARE|BEGIN|USE)\b",
+    re.IGNORECASE
+)
+
+def _first_non_comment_code_line(text: str) -> Tuple[int, str]:
+    """
+    Retourne (index, contenu) de la première ligne non vide qui n'est pas un commentaire SQL.
+    Si rien trouvé, retourne (-1, "").
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("--") or s.startswith("/*"):
+            # ligne de commentaire SQL -> on ignore
+            continue
+        return i, line
+    return -1, ""
+
+def _find_first_sql_statement_start(text: str) -> int:
+    """
+    Renvoie l'index de ligne de la première ligne qui ressemble à un début d'instruction SQL.
+    Sinon -1.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if SQL_START_RE.search(line):
+            return i
+    return -1
+
 def _new_session_id() -> str:
     return str(uuid.uuid4())
 
@@ -319,6 +351,7 @@ with st.expander("⚙️ Options"):
         mime="application/json",
         data=mapping_json,
     )
+    auto_clean = st.checkbox("Nettoyer automatiquement le texte non-SQL avant la première instruction", value=True, help="Si coché, les lignes situées avant la première instruction SQL (SELECT/INSERT/...) seront ignorées.")
 
 left, right = st.columns(2)
 
@@ -328,7 +361,7 @@ with left:
     src_sql = st.text_area(
         "Collez votre requête SQL d'origine (T-SQL)",
         height=250,
-        placeholder="-- Exemple\nUSE AdventureWorks2019;\nSELECT p.PersonID, p.LastName FROM AdventureWorks2019.Person.Person AS p WHERE p.LastName = 'Smith';\n-- Un commentaire avec Person.Person et [LastName]",
+        placeholder="-- Exemple\nUSE AdventureWorks2019;\nSELECT ...",
         key="src_sql_input",
     )
 
@@ -336,18 +369,35 @@ with left:
         if not src_sql.strip():
             st.warning("Veuillez coller une requête SQL.")
         else:
+            # --- Contrôle d’entrée ---
+            idx_first, first_line = _first_non_comment_code_line(src_sql)
+            if idx_first != -1 and not SQL_START_RE.search(first_line):
+                # L’utilisateur a du texte non SQL avant la requête
+                start_stmt = _find_first_sql_statement_start(src_sql)
+                if auto_clean and start_stmt != -1:
+                    # Nettoyage automatique : on coupe tout avant la première ligne SQL
+                    src_sql = "\n".join(src_sql.splitlines()[start_stmt:])
+                    st.info("Du texte non SQL a été détecté avant la requête et a été ignoré automatiquement.")
+                else:
+                    st.error(
+                        "Le texte avant la requête ne ressemble pas à du SQL.\n"
+                        "Veuillez supprimer ce texte ou le transformer en commentaire SQL en le préfixant par `--`.\n\n"
+                        f"Première ligne problématique : `{first_line.strip()}`"
+                    )
+                    st.stop()
+
             try:
                 anonym_sql, _ = anonymize_sql(src_sql, st.session_state.name_mapper)
-                st.session_state["anonym_sql"] = anonym_sql  # <<< mémorise le résultat
+                st.session_state["anonym_sql"] = anonym_sql
                 st.info("Copiez ce SQL anonymisé et utilisez-le dans votre prompt ChatGPT. Conservez le mapping (export) pour pouvoir rétablir les noms ensuite.")
             except Exception as e:
                 st.error(str(e))
 
-    # Affichage persistant du résultat + bouton copier
     anonym_result = st.session_state.get("anonym_sql", "")
     st.text_area("Requête anonymisée", value=anonym_result, height=250, key="anonym_result", disabled=not bool(anonym_result))
     if anonym_result:
         copy_to_clipboard_button(anonym_result, key="copy_anonym", label="📋 Copier la requête anonymisée")
+
 
 
 # ======= DÉANONYMISER =======
@@ -356,7 +406,7 @@ with right:
     mod_sql = st.text_area(
         "Collez la requête modifiée (toujours avec les noms anonymes)",
         height=250,
-        placeholder="-- Collez ici le SQL renvoyé par ChatGPT, basé sur les noms anonymes (DB_*, SC_*, T_*, C_*).",
+        placeholder="-- Collez ici le SQL renvoyé par ChatGPT, basé sur DB_*, SC_*, T_*, C_*.",
         key="mod_sql_input",
     )
 
@@ -364,18 +414,33 @@ with right:
         if not mod_sql.strip():
             st.warning("Veuillez coller une requête SQL.")
         else:
+            # --- Contrôle d’entrée ---
+            idx_first, first_line = _first_non_comment_code_line(mod_sql)
+            if idx_first != -1 and not SQL_START_RE.search(first_line):
+                start_stmt = _find_first_sql_statement_start(mod_sql)
+                if auto_clean and start_stmt != -1:
+                    mod_sql = "\n".join(mod_sql.splitlines()[start_stmt:])
+                    st.info("Du texte non SQL a été détecté avant la requête et a été ignoré automatiquement.")
+                else:
+                    st.error(
+                        "Le texte avant la requête ne ressemble pas à du SQL.\n"
+                        "Veuillez supprimer ce texte ou le transformer en commentaire SQL en le préfixant par `--`.\n\n"
+                        f"Première ligne problématique : `{first_line.strip()}`"
+                    )
+                    st.stop()
+
             try:
                 deanon_sql = deanonymize_sql(mod_sql, st.session_state.name_mapper)
-                st.session_state["deanon_sql"] = deanon_sql  # <<< mémorise le résultat
+                st.session_state["deanon_sql"] = deanon_sql
                 st.info("Vérifiez le résultat. Les identifiants inconnus (non présents dans le mapping) sont laissés tels quels.")
             except Exception as e:
                 st.error(str(e))
 
-    # Affichage persistant du résultat + bouton copier
     deanon_result = st.session_state.get("deanon_sql", "")
     st.text_area("Requête rétablie (noms d'origine)", value=deanon_result, height=250, key="deanonym_result", disabled=not bool(deanon_result))
     if deanon_result:
         copy_to_clipboard_button(deanon_result, key="copy_deanon", label="📋 Copier la requête dé-anonymisée")
+
 
 
 st.divider()
