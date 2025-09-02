@@ -335,3 +335,4 @@ USE AdventureWorks2019;
 SELECT p.PersonID, p.LastName
 FROM AdventureWorks2019.Person.Person AS p
 WHERE p.LastName = 'Smith';
+
