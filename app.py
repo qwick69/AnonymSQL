@@ -320,19 +320,4 @@ with right:
 
 st.divider()
 
-st.markdown(
-    """
-### ✅ Ce qui est géré
-- **Commentaires anonymisés** (`-- ...`, `/* ... */`), mais **chaînes** (`'...'`, `"..."`) inchangées.
-- **`USE <database>`** : la base est (dé)anonymisée comme les autres identifiants.
-- **Crochets** : si vous écrivez `[NomTable]`, ils sont **préservés** dans le texte final.
-
-### 🧪 Exemple rapide
-**Entrée :**
-```sql
-USE AdventureWorks2019;
--- Je veux Person.Person et [LastName]
-SELECT p.PersonID, p.LastName
-FROM AdventureWorks2019.Person.Person AS p
-WHERE p.LastName = 'Smith';
 
