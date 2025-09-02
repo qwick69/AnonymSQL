@@ -295,8 +295,12 @@ with left:
         else:
             try:
                 anonym_sql, _ = anonymize_sql(src_sql, st.session_state.name_mapper)
-                st.text_area("Requête anonymisée", value=anonym_sql, height=250)
+                st.text_area("Requête anonymisée", value=anonym_sql, height=250, key="anonym_result")
                 st.info("Copiez ce SQL anonymisé et utilisez-le dans votre prompt ChatGPT. Conservez le mapping (export) pour pouvoir rétablir les noms ensuite.")
+
+                # Bouton copier anonymisé
+                st.button("📋 Copier la requête anonymisée", on_click=st.session_state.setdefault, args=("copy_buffer", anonym_sql))
+
             except Exception as e:
                 st.error(str(e))
 
@@ -313,11 +317,13 @@ with right:
         else:
             try:
                 deanon_sql = deanonymize_sql(mod_sql, st.session_state.name_mapper)
-                st.text_area("Requête rétablie (noms d'origine)", value=deanon_sql, height=250)
+                st.text_area("Requête rétablie (noms d'origine)", value=deanon_sql, height=250, key="deanonym_result")
                 st.info("Vérifiez le résultat. Les identifiants inconnus (non présents dans le mapping) sont laissés tels quels.")
+
+                # Bouton copier déanonymisé
+                st.button("📋 Copier la requête dé-anonymisée", on_click=st.session_state.setdefault, args=("copy_buffer", deanon_sql))
+
             except Exception as e:
                 st.error(str(e))
 
 st.divider()
-
-
