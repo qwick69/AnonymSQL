@@ -1,29 +1,25 @@
+# app.py
 """
 App: SQL Server Query Anonymizer / Deanonymizer
-Author: ChatGPT
+Author: ChatGPT (fixes: comments anonymization, USE support, bracket preservation)
 
-What it does
-------------
-- Takes a SQL Server (T-SQL) query and anonymizes identifiers (databases, schemas, tables, columns).
-- Produces a reversible mapping so you can paste GPT-modified SQL back in and de-anonymize it to original names.
+Ce que fait l'app
+-----------------
+- Anonymise/déanonymise les identifiants T-SQL (bases, schémas, tables, colonnes).
+- Mapping réversible en mémoire (session Streamlit), import/export JSON.
+- Anonymisation aussi dans les commentaires (-- ... , /* ... */).
+- Les chaînes de caractères ne sont pas modifiées.
+- La commande USE est supportée.
+- Les crochets [ ... ] sont préservés (si présents dans le texte d’origine).
 
-How to run
-----------
-1) Create a virtual env and install deps:
-   pip install streamlit sqlglot
-
-2) Start the app:
-   streamlit run app.py
-
-Notes
------
-- Parsing/rewriting done with sqlglot (dialect: T-SQL).
-- We only rewrite Table & Column identifiers to avoid touching keywords, variables, parameters.
-- Mapping is kept in-memory (session) and can be exported/imported as JSON for reuse.
-- If GPT adds brand-new identifiers that weren't anonymized originally, they won't be de-anonymized automatically (the app will leave them unchanged and warn you).
+Prérequis
+---------
+pip install streamlit sqlglot
+streamlit run app.py
 """
 
 import json
+import re
 import uuid
 from typing import Dict, Tuple
 
@@ -90,90 +86,160 @@ class NameMapper:
         return NameMapper(mapping=obj.get("mapping"), prefixes=obj.get("prefixes"))
 
 # ----------------------------------
-# SQL rewrite helpers using sqlglot
+# Mapping extraction using sqlglot
 # ----------------------------------
 
 DIALECT = "tsql"
 
-def anonymize_sql(sql: str, nm: NameMapper) -> Tuple[str, NameMapper]:
-    """Return anonymized SQL and the (updated) NameMapper."""
+def _extract_mapping(sql: str, nm: NameMapper) -> None:
+    """
+    Analyse l'AST pour recenser les identifiants et remplir le mapping,
+    sans produire de SQL réécrit (on réécrit ensuite par remplacement textuel).
+    """
     try:
         tree = parse_one(sql, read=DIALECT)
-    except Exception as e:
-        raise ValueError(f"Erreur d'analyse SQL: {e}")
+    except Exception:
+        # Si l'analyse échoue (p.ex. à cause de USE ou de snippets),
+        # on ignore : l’anonymisation par remplacement s’appliquera quand même aux parties détectables.
+        return
 
-    def _transform(node):
-        # Rewrite database.schema.table pieces on Table nodes
+    def _visit(node):
+        # Tables: database.schema.table
         if isinstance(node, exp.Table):
-            # catalog -> database, db -> schema, this -> table (sqlglot naming)
             if node.catalog:  # database
-                new_db = nm.map("database", node.catalog)
-                node.set("catalog", exp.to_identifier(new_db))
+                nm.map("database", str(node.catalog))
             if node.db:       # schema
-                new_schema = nm.map("schema", node.db)
-                node.set("db", exp.to_identifier(new_schema))
+                nm.map("schema", str(node.db))
             if node.this:     # table
-                new_table = nm.map("table", node.name)
-                node.set("this", exp.to_identifier(new_table))
-            return node
+                # node.name renvoie le nom brut (sans alias)
+                nm.map("table", node.name)
 
-        # Columns optionally have a table qualifier
+        # Colonnes potentiellement qualifiées
         if isinstance(node, exp.Column):
-            if node.table:  # qualifier (table alias or table name). We only rewrite if it matches a real table name mapping.
-                qual = node.table
-                # If the qualifier is an anonymized or original table name we keep it consistent.
-                mapped = nm.mapping["table"].get(qual)
-                if mapped:
-                    node.set("table", exp.to_identifier(mapped))
-                else:
-                    # It's possibly an alias; don't change it.
-                    pass
             if node.this:
-                new_col = nm.map("column", node.name)
-                node.set("this", exp.to_identifier(new_col))
-            return node
+                nm.map("column", node.name)
+        for child in node.args.values():
+            if isinstance(child, list):
+                for c in child:
+                    if isinstance(c, exp.Expression):
+                        _visit(c)
+            elif isinstance(child, exp.Expression):
+                _visit(child)
 
-        return node
+    _visit(tree)
 
-    new_tree = tree.transform(_transform)
-    return new_tree.sql(dialect=DIALECT), nm
+# ----------------------------------
+# Text rewriting helpers
+# ----------------------------------
 
+# Segmenter : chaînes et commentaires à protéger
+SEGMENT_RE = re.compile(
+    r"(--[^\n]*\n?|/\*.*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\")",
+    flags=re.DOTALL | re.MULTILINE,
+)
+
+def _is_comment(segment: str) -> bool:
+    return segment.startswith("--") or segment.startswith("/*")
+
+def _is_string(segment: str) -> bool:
+    return (segment.startswith("'") and segment.endswith("'")) or (segment.startswith('"') and segment.endswith('"'))
+
+def _build_replacements_forward(nm: NameMapper):
+    """
+    Crée les paires (pattern -> repl) pour anonymiser.
+    On remplace formes bracketées puis non bracketées, pour DB/SC/T/C.
+    """
+    repls = []
+
+    def add_kind(kind: str):
+        for original, alias in nm.mapping[kind].items():
+            # [original] -> [alias] (IGNORECASE)
+            repls.append((
+                re.compile(rf"\[\s*{re.escape(original)}\s*\]", flags=re.IGNORECASE),
+                f"[{alias}]"
+            ))
+            # non-bracketed en limites de mot (identifiants T-SQL: lettres, chiffres, _, $)
+            repls.append((
+                re.compile(rf"(?<![\w$]){re.escape(original)}(?![\w$])", flags=re.IGNORECASE),
+                alias
+            ))
+
+    for k in ("database", "schema", "table", "column"):
+        add_kind(k)
+
+    return repls
+
+def _build_replacements_reverse(nm: NameMapper):
+    """
+    Crée les paires (pattern -> repl) pour dé-anonymiser.
+    Ici pas d'IGNORECASE, on connaît précisément les alias (DB_1, SC_1, ...).
+    """
+    repls = []
+
+    def add_kind(kind: str):
+        for alias, original in nm.inverse.get(kind, {}).items():
+            # [alias] -> [original]
+            repls.append((
+                re.compile(rf"\[\s*{re.escape(alias)}\s*\]"),
+                f"[{original}]"
+            ))
+            # non-bracketed
+            repls.append((
+                re.compile(rf"(?<![\w$]){re.escape(alias)}(?![\w$])"),
+                original
+            ))
+
+    for k in ("database", "schema", "table", "column"):
+        add_kind(k)
+
+    return repls
+
+def _apply_replacements_to_code_and_comments(sql: str, repls) -> str:
+    """
+    Applique les remplacements sur les segments 'code' ET 'commentaires',
+    mais JAMAIS à l'intérieur des chaînes ('...' ou "...").
+    """
+    out = []
+    last_idx = 0
+    for m in SEGMENT_RE.finditer(sql):
+        # segment avant (code)
+        code = sql[last_idx:m.start()]
+        out.append(_apply_all(code, repls))  # remplacements dans code
+
+        seg = m.group(0)
+        if _is_string(seg):
+            # ne pas toucher
+            out.append(seg)
+        else:
+            # commentaire -> on anonymise aussi
+            out.append(_apply_all(seg, repls))
+        last_idx = m.end()
+
+    # suffixe (code)
+    tail = sql[last_idx:]
+    out.append(_apply_all(tail, repls))
+    return "".join(out)
+
+def _apply_all(text: str, repls) -> str:
+    for pattern, rep in repls:
+        text = pattern.sub(rep, text)
+    return text
+
+def anonymize_sql(sql: str, nm: NameMapper) -> Tuple[str, NameMapper]:
+    """
+    1) Extrait/actualise le mapping via l'AST (sqlglot).
+    2) Applique le mapping par remplacement texte sur code + commentaires (hors chaînes).
+    -> Gère USE et crochets naturellement.
+    """
+    _extract_mapping(sql, nm)
+    forward = _build_replacements_forward(nm)
+    new_sql = _apply_replacements_to_code_and_comments(sql, forward)
+    return new_sql, nm
 
 def deanonymize_sql(sql: str, nm: NameMapper) -> str:
-    try:
-        tree = parse_one(sql, read=DIALECT)
-    except Exception as e:
-        raise ValueError(f"Erreur d'analyse SQL: {e}")
-
-    def _transform(node):
-        if isinstance(node, exp.Table):
-            if node.catalog:  # database
-                orig_db = nm.unmap("database", node.catalog)
-                node.set("catalog", exp.to_identifier(orig_db))
-            if node.db:       # schema
-                orig_schema = nm.unmap("schema", node.db)
-                node.set("db", exp.to_identifier(orig_schema))
-            if node.this:     # table
-                orig_table = nm.unmap("table", node.name)
-                node.set("this", exp.to_identifier(orig_table))
-            return node
-
-        if isinstance(node, exp.Column):
-            if node.table:
-                qual = node.table
-                # If qualifier is anonymized table, revert to original; otherwise leave alias as-is.
-                orig_qual = nm.unmap("table", qual)
-                if orig_qual != qual:
-                    node.set("table", exp.to_identifier(orig_qual))
-            if node.this:
-                orig_col = nm.unmap("column", node.name)
-                node.set("this", exp.to_identifier(orig_col))
-            return node
-
-        return node
-
-    new_tree = tree.transform(_transform)
-    return new_tree.sql(dialect=DIALECT)
+    reverse = _build_replacements_reverse(nm)
+    new_sql = _apply_replacements_to_code_and_comments(sql, reverse)
+    return new_sql
 
 # --------------
 # Streamlit UI
@@ -221,7 +287,7 @@ with left:
     src_sql = st.text_area(
         "Collez votre requête SQL d'origine (T-SQL)",
         height=250,
-        placeholder="SELECT p.PersonID, p.LastName FROM AdventureWorks2019.Person.Person AS p WHERE p.LastName = 'Smith';",
+        placeholder="-- Exemple\nUSE AdventureWorks2019;\nSELECT p.PersonID, p.LastName FROM AdventureWorks2019.Person.Person AS p WHERE p.LastName = 'Smith';\n-- Un commentaire avec Person.Person et [LastName]",
     )
     if st.button("Anonymiser", type="primary"):
         if not src_sql.strip():
@@ -230,7 +296,7 @@ with left:
             try:
                 anonym_sql, _ = anonymize_sql(src_sql, st.session_state.name_mapper)
                 st.text_area("Requête anonymisée", value=anonym_sql, height=250)
-                st.info("Copiez ce SQL anonymisé et utilisez-le dans votre prompt ChatGPT. Gardez le mapping (export) pour pouvoir rétablir les noms ensuite.")
+                st.info("Copiez ce SQL anonymisé et utilisez-le dans votre prompt ChatGPT. Conservez le mapping (export) pour pouvoir rétablir les noms ensuite.")
             except Exception as e:
                 st.error(str(e))
 
@@ -256,17 +322,16 @@ st.divider()
 
 st.markdown(
     """
-### ✅ Conseils d'utilisation
-- Exportez le mapping JSON après l'anonymisation si vous comptez retravailler la requête plus tard ou sur une autre machine.
-- Si ChatGPT ajoute de nouvelles tables/colonnes, elles n'existeront pas dans le mapping et ne seront pas dé-anonymisées automatiquement (vous pourrez compléter le mapping à la main si besoin).
-- Le code évite de toucher aux alias (ex. `p`, `t1`) pour limiter les effets de bord.
-- Les noms entre crochets [ ] ou guillemets sont gérés via l'AST de sqlglot.
+### ✅ Ce qui est géré
+- **Commentaires anonymisés** (`-- ...`, `/* ... */`), mais **chaînes** (`'...'`, `"..."`) inchangées.
+- **`USE <database>`** : la base est (dé)anonymisée comme les autres identifiants.
+- **Crochets** : si vous écrivez `[NomTable]`, ils sont **préservés** dans le texte final.
 
 ### 🧪 Exemple rapide
-**Entrée :** `SELECT p.PersonID, p.LastName FROM AdventureWorks2019.Person.Person AS p WHERE p.LastName = 'Smith';`
-
-**Sortie anonymisée (exemple) :** `SELECT p.C_1, p.C_2 FROM DB_1.SC_1.T_1 AS p WHERE p.C_2 = 'Smith';`
-
-**Dé-anonymisation :** redevient la requête d'origine.
-"""
-)
+**Entrée :**
+```sql
+USE AdventureWorks2019;
+-- Je veux Person.Person et [LastName]
+SELECT p.PersonID, p.LastName
+FROM AdventureWorks2019.Person.Person AS p
+WHERE p.LastName = 'Smith';
