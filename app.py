@@ -1,7 +1,7 @@
 # app.py
 """
 App: SQL Server Query Anonymizer / Deanonymizer
-Author: ChatGPT (fixes: comments anonymization, USE support, bracket preservation)
+Author: ChatGPT (fixes: comments anonymization, robust USE support, bracket preservation)
 
 Ce que fait l'app
 -----------------
@@ -9,7 +9,7 @@ Ce que fait l'app
 - Mapping réversible en mémoire (session Streamlit), import/export JSON.
 - Anonymisation aussi dans les commentaires (-- ... , /* ... */).
 - Les chaînes de caractères ne sont pas modifiées.
-- La commande USE est supportée.
+- La commande USE est supportée, même sans point-virgule juste avant un SELECT.
 - Les crochets [ ... ] sont préservés (si présents dans le texte d’origine).
 
 Prérequis
@@ -125,16 +125,83 @@ class NameMapper:
 
 DIALECT = "tsql"
 
+# --- NEW: détection USE (hors chaînes/commentaires) ---
+SEGMENT_RE = re.compile(
+    r"(--[^\n]*\n?|/\*.*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\")",
+    flags=re.DOTALL | re.MULTILINE,
+)
+
+USE_DB_RE = re.compile(
+    r"(?i)\bUSE\s+(?:\[\s*(?P<bracket>[^\]\r\n;]+)\s*\]|(?P<plain>[A-Za-z0-9_.$]+))"
+)
+
+def _is_comment(segment: str) -> bool:
+    return segment.startswith("--") or segment.startswith("/*")
+
+def _is_string(segment: str) -> bool:
+    return (segment.startswith("'") and segment.endswith("'")) or (segment.startswith('"') and segment.endswith('"'))
+
+def _scan_code_segments(sql: str):
+    """Itère sur les segments de code (hors chaînes/commentaires)."""
+    last_idx = 0
+    for m in SEGMENT_RE.finditer(sql):
+        # code avant le segment protégé
+        yield sql[last_idx:m.start()]
+        # sauter le segment protégé
+        last_idx = m.end()
+    # suffixe
+    yield sql[last_idx:]
+
+def _map_use_databases(sql: str, nm: NameMapper) -> None:
+    """
+    Repère les instructions USE ... dans les segments de code et mappe le nom de base.
+    Gère : USE db | USE [db] | USE db; | USE [db] ; | USE db SELECT ...
+    """
+    for code in _scan_code_segments(sql):
+        for m in USE_DB_RE.finditer(code):
+            name = (m.group("bracket") or m.group("plain") or "").strip()
+            if name:
+                nm.map("database", name)
+
+def _strip_use_for_parse(sql: str) -> str:
+    """
+    Supprime les USE ... uniquement dans les segments de code, afin de permettre à sqlglot
+    de parser correctement les SELECT qui suivent (même sans point-virgule).
+    """
+    out = []
+    last_idx = 0
+    for m in SEGMENT_RE.finditer(sql):
+        code = sql[last_idx:m.start()]
+        # supprimer USE ... (ne pas toucher aux chaînes/commentaires)
+        code = USE_DB_RE.sub("", code)
+        out.append(code)
+        # conserver tel quel le segment protégé
+        out.append(m.group(0))
+        last_idx = m.end()
+    tail = sql[last_idx:]
+    tail = USE_DB_RE.sub("", tail)
+    out.append(tail)
+    return "".join(out)
+
 def _extract_mapping(sql: str, nm: NameMapper) -> None:
     """
     Analyse l'AST pour recenser les identifiants et remplir le mapping,
     sans produire de SQL réécrit (on réécrit ensuite par remplacement textuel).
+
+    NEW: on mappe aussi les bases des instructions USE, et on retire
+    ces USE du texte envoyé au parseur pour éviter un échec d'analyse.
     """
+    # 1) Mapper les bases rencontrées dans USE ...
+    _map_use_databases(sql, nm)
+
+    # 2) Retirer USE du texte à parser pour ne garder que les SELECT/UPDATE/...
+    sql_for_parse = _strip_use_for_parse(sql)
+
     try:
-        tree = parse_one(sql, read=DIALECT)
+        tree = parse_one(sql_for_parse, read=DIALECT)
     except Exception:
-        # Si l'analyse échoue (p.ex. à cause de USE ou de snippets),
-        # on ignore : l’anonymisation par remplacement s’appliquera quand même aux parties détectables.
+        # Si l’analyse échoue, on ignore : l’anonymisation par remplacement
+        # s’appliquera quand même aux parties détectables (USE inclus).
         return
 
     def _visit(node):
@@ -145,7 +212,6 @@ def _extract_mapping(sql: str, nm: NameMapper) -> None:
             if node.db:       # schema
                 nm.map("schema", str(node.db))
             if node.this:     # table
-                # node.name renvoie le nom brut (sans alias)
                 nm.map("table", node.name)
 
         # Colonnes potentiellement qualifiées
@@ -165,18 +231,6 @@ def _extract_mapping(sql: str, nm: NameMapper) -> None:
 # ----------------------------------
 # Text rewriting helpers
 # ----------------------------------
-
-# Segmenter : chaînes et commentaires à protéger
-SEGMENT_RE = re.compile(
-    r"(--[^\n]*\n?|/\*.*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\")",
-    flags=re.DOTALL | re.MULTILINE,
-)
-
-def _is_comment(segment: str) -> bool:
-    return segment.startswith("--") or segment.startswith("/*")
-
-def _is_string(segment: str) -> bool:
-    return (segment.startswith("'") and segment.endswith("'")) or (segment.startswith('"') and segment.endswith('"'))
 
 def _build_replacements_forward(nm: NameMapper):
     """
@@ -228,6 +282,11 @@ def _build_replacements_reverse(nm: NameMapper):
 
     return repls
 
+def _apply_all(text: str, repls) -> str:
+    for pattern, rep in repls:
+        text = pattern.sub(rep, text)
+    return text
+
 def _apply_replacements_to_code_and_comments(sql: str, repls) -> str:
     """
     Applique les remplacements sur les segments 'code' ET 'commentaires',
@@ -253,11 +312,6 @@ def _apply_replacements_to_code_and_comments(sql: str, repls) -> str:
     tail = sql[last_idx:]
     out.append(_apply_all(tail, repls))
     return "".join(out)
-
-def _apply_all(text: str, repls) -> str:
-    for pattern, rep in repls:
-        text = pattern.sub(rep, text)
-    return text
 
 def copy_to_clipboard_button(text: str, key: str, label: str = "📋 Copier"):
     """Affiche un bouton qui copie 'text' dans le presse-papiers (côté navigateur)."""
@@ -297,9 +351,9 @@ def copy_to_clipboard_button(text: str, key: str, label: str = "📋 Copier"):
         </script>
     """, height=60)
 
-def anonymize_sql(sql: str, nm: NameMapper) -> Tuple[str, NameMapper]:
+def anonymize_sql(sql: str, nm: NameMapper):
     """
-    1) Extrait/actualise le mapping via l'AST (sqlglot).
+    1) Extrait/actualise le mapping via l'AST (sqlglot) – en retirant USE pour l'analyse.
     2) Applique le mapping par remplacement texte sur code + commentaires (hors chaînes).
     -> Gère USE et crochets naturellement.
     """
@@ -361,7 +415,7 @@ with left:
     src_sql = st.text_area(
         "Collez votre requête SQL d'origine (T-SQL)",
         height=250,
-        placeholder="-- Exemple\nUSE AdventureWorks2019;\nSELECT ...",
+        placeholder="-- Exemple\nUSE AdventureWorks2019\nSELECT TOP 10 * FROM [dbo].[Person]",
         key="src_sql_input",
     )
 
@@ -397,8 +451,6 @@ with left:
     st.text_area("Requête anonymisée", value=anonym_result, height=250, key="anonym_result", disabled=not bool(anonym_result))
     if anonym_result:
         copy_to_clipboard_button(anonym_result, key="copy_anonym", label="📋 Copier la requête anonymisée")
-
-
 
 # ======= DÉANONYMISER =======
 with right:
@@ -440,7 +492,5 @@ with right:
     st.text_area("Requête rétablie (noms d'origine)", value=deanon_result, height=250, key="deanonym_result", disabled=not bool(deanon_result))
     if deanon_result:
         copy_to_clipboard_button(deanon_result, key="copy_deanon", label="📋 Copier la requête dé-anonymisée")
-
-
 
 st.divider()
